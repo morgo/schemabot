@@ -68,10 +68,10 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Post plan comment
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
-	// Create check run and update aggregate
-	headSHA, checkErr := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	// Store per-database check record and update aggregate
+	headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
-		h.logger.Error("failed to create plan check run", "repo", repo, "pr", pr, "error", checkErr)
+		h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "error", checkErr)
 	}
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
@@ -111,6 +111,28 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 			return
 		}
 		environments = config.GetEnvironments()
+	}
+
+	// Filter environments to those this instance is allowed to handle
+	if h.service != nil {
+		config := h.service.Config()
+		if len(config.AllowedEnvironments) > 0 {
+			var allowed []string
+			for _, env := range environments {
+				if config.IsEnvironmentAllowed(env) {
+					allowed = append(allowed, env)
+				} else {
+					h.logger.Debug("skipping environment not owned by this instance",
+						"repo", repo, "pr", pr, "env", env)
+				}
+			}
+			environments = allowed
+		}
+	}
+
+	if len(environments) == 0 {
+		h.logger.Info("no environments to plan after filtering", "repo", repo, "pr", pr)
+		return
 	}
 
 	// Collect plans for all environments
@@ -159,10 +181,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		commentData := buildPlanCommentData(schemaResult, planResp, env, requestedBy)
 		multiEnvData.Plans[env] = &commentData
 
-		// Create check run per environment
-		sha, checkErr := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, env, installationID)
+		// Store per-database check record per environment
+		sha, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
 		if checkErr != nil {
-			h.logger.Error("failed to create plan check run", "repo", repo, "pr", pr, "env", env, "error", checkErr)
+			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
 		}
 		if sha != "" {
 			headSHA = sha

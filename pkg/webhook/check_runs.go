@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -35,76 +36,65 @@ const (
 // conclusion so branch protection only needs one stable name.
 const aggregateCheckName = "SchemaBot"
 
-// aggregateSentinel is used for environment, database type, and database name when
-// storing the aggregate check record in the checks table. Distinguishes it from
-// per-database checks which use real values.
+// aggregateSentinel is used for database type and database name when storing
+// aggregate check records in the checks table. For the environment field,
+// per-environment aggregates use the real environment name while the global
+// aggregate (no allowed_environments) uses aggregateSentinel.
 const aggregateSentinel = "_aggregate"
 
-// isAggregateCheck returns true if the check is the aggregate (not a per-database check).
+// aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
+// e.g., "SchemaBot (staging)" or "SchemaBot (production)".
+func aggregateCheckNameForEnv(env string) string {
+	return fmt.Sprintf("SchemaBot (%s)", env)
+}
+
+// filterChecksByEnvironment returns only checks that belong to the given environment.
+// Aggregate checks are excluded.
+func filterChecksByEnvironment(checks []*storage.Check, env string) []*storage.Check {
+	var filtered []*storage.Check
+	for _, c := range checks {
+		if isAggregateCheck(c) {
+			continue
+		}
+		if c.Environment == env {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// isAggregateCheck returns true if the check is an aggregate (not a per-database check).
+// Aggregate checks use the sentinel value for DatabaseType and DatabaseName.
+// The Environment field is either aggregateSentinel (global aggregate) or a real
+// environment name (per-environment aggregate when allowed_environments is configured).
 func isAggregateCheck(c *storage.Check) bool {
-	return c.Environment == aggregateSentinel &&
-		c.DatabaseType == aggregateSentinel &&
+	return c.DatabaseType == aggregateSentinel &&
 		c.DatabaseName == aggregateSentinel
 }
 
-// checkRunName returns the canonical check run name for a given environment, database type, and database.
-func checkRunName(environment, dbType, database string) string {
-	return fmt.Sprintf("SchemaBot: %s/%s/%s", environment, dbType, database)
-}
-
-// createPlanCheckRun creates a GitHub Check Run after a plan is generated.
-// Returns the PR head SHA used for the check run. Check run failures are non-fatal —
-// they should not prevent the plan from being posted.
-func (h *Handler) createPlanCheckRun(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, installationID int64) (string, error) {
-	// Get PR head SHA for the check run
+// storePlanCheckRecord stores a per-database check record after a plan is generated.
+// The record is used internally by the aggregate check to compute its overall status.
+// No per-database GitHub Check Run is created — only the aggregate is visible on the PR.
+// Returns the PR head SHA. Failures are non-fatal.
+func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
-		return "", fmt.Errorf("fetch PR for check run: %w", err)
+		return "", fmt.Errorf("fetch PR for check record: %w", err)
 	}
 
 	tables := planResp.FlatTables()
 	hasChanges := len(tables) > 0
-	checkName := checkRunName(environment, schema.Type, schema.Database)
 
 	var conclusion string
-	var title string
-	var summary string
-
 	switch {
 	case len(planResp.Errors) > 0:
 		conclusion = checkConclusionFailure
-		title = "Plan failed"
-		summary = fmt.Sprintf("Plan failed with %d error(s)", len(planResp.Errors))
 	case hasChanges:
 		conclusion = checkConclusionActionRequired
-		title = fmt.Sprintf("%d schema change(s) detected", len(tables))
-		summary = buildCheckRunSummary(planResp)
 	default:
 		conclusion = checkConclusionSuccess
-		title = "No schema changes"
-		summary = "Schema is up to date — no changes detected."
 	}
 
-	// Build detailed text with DDL statements
-	text := buildCheckRunText(planResp)
-
-	opts := ghclient.CheckRunOptions{
-		Name:       checkName,
-		Status:     checkStatusCompleted,
-		Conclusion: conclusion,
-		Output: &ghclient.CheckRunOutput{
-			Title:   title,
-			Summary: summary,
-			Text:    text,
-		},
-	}
-
-	checkRunID, err := client.CreateCheckRun(ctx, repo, prInfo.HeadSHA, opts)
-	if err != nil {
-		return "", fmt.Errorf("create check run: %w", err)
-	}
-
-	// Store check record in CheckStore
 	check := &storage.Check{
 		Repository:   repo,
 		PullRequest:  pr,
@@ -112,7 +102,6 @@ func (h *Handler) createPlanCheckRun(ctx context.Context, client *ghclient.Insta
 		Environment:  environment,
 		DatabaseType: schema.Type,
 		DatabaseName: schema.Database,
-		CheckRunID:   checkRunID,
 		HasChanges:   hasChanges,
 		Status:       checkStatusCompleted,
 		Conclusion:   conclusion,
@@ -124,119 +113,31 @@ func (h *Handler) createPlanCheckRun(ctx context.Context, client *ghclient.Insta
 	return prInfo.HeadSHA, nil
 }
 
-// buildCheckRunSummary builds a brief summary for the check run.
-func buildCheckRunSummary(planResp *apitypes.PlanResponse) string {
-	tables := planResp.FlatTables()
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "**%d DDL statement(s)**\n\n", len(tables))
-
-	for _, table := range tables {
-		fmt.Fprintf(&sb, "- `%s` (%s)\n", table.TableName, table.ChangeType)
-	}
-
-	if lintViolations := planResp.LintNonErrors(); len(lintViolations) > 0 {
-		fmt.Fprintf(&sb, "\n**%d lint warning(s)**\n", len(lintViolations))
-	}
-
-	if lintErrors := planResp.LintErrors(); len(lintErrors) > 0 {
-		fmt.Fprintf(&sb, "\n**%d unsafe change(s) require --allow-unsafe**\n", len(lintErrors))
-	}
-
-	return sb.String()
-}
-
-// buildCheckRunText builds detailed DDL output for the check run.
-func buildCheckRunText(planResp *apitypes.PlanResponse) string {
-	tables := planResp.FlatTables()
-	if len(tables) == 0 {
-		return ""
-	}
-
-	var sb strings.Builder
-	sb.WriteString("## DDL Statements\n\n```sql\n")
-
-	for i, table := range tables {
-		if table.IsUnsafe {
-			fmt.Fprintf(&sb, "-- WARNING: unsafe change (%s)\n", table.UnsafeReason)
-		}
-		fmt.Fprintf(&sb, "-- %s: %s\n", table.ChangeType, table.TableName)
-		sb.WriteString(table.DDL)
-		if i < len(tables)-1 {
-			sb.WriteString("\n\n")
-		} else {
-			sb.WriteString("\n")
-		}
-	}
-	sb.WriteString("```\n")
-
-	// Truncate if over GitHub's limit
-	text := sb.String()
-	if len(text) > maxCheckRunTextLength {
-		text = text[:maxCheckRunTextLength-100] + "\n...\n(truncated — view full plan in PR comment)"
-	}
-
-	return text
-}
-
-// updateCheckRunForApplyResult updates the GitHub check run after an apply reaches
-// a terminal state. On success, the check transitions to "success" (unblocking merge).
-// On failure/stop/revert, it transitions to "failure".
-func (h *Handler) updateCheckRunForApplyResult(ctx context.Context, repo string, pr int, installationID int64, apply *storage.Apply) {
-	// Look up the stored check record for this PR+env+database
+// updateCheckRecordForApplyResult updates the stored check record after an apply
+// reaches a terminal state. The aggregate check is updated separately to reflect
+// the new status on the PR.
+func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo string, pr int, apply *storage.Apply) {
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
 	if err != nil {
 		h.logger.Error("failed to look up check for apply result", "error", err)
 		return
 	}
-	if check == nil || check.CheckRunID == 0 {
-		h.logger.Warn("no check run found to update after apply",
+	if check == nil {
+		h.logger.Warn("no check record found to update after apply",
 			"repo", repo, "pr", pr, "database", apply.Database, "environment", apply.Environment)
 		return
 	}
 
-	client, err := h.ghClient.ForInstallation(installationID)
-	if err != nil {
-		h.logger.Error("failed to create GitHub client for check update", "error", err)
-		return
-	}
-
-	var conclusion, title, summary string
+	var conclusion string
 	switch apply.State {
 	case state.Apply.Completed:
 		conclusion = checkConclusionSuccess
-		title = "Schema changes applied"
-		summary = fmt.Sprintf("All schema changes for `%s` (%s) have been applied successfully.", apply.Database, apply.Environment)
 	case state.Apply.Failed:
 		conclusion = checkConclusionFailure
-		title = "Schema change failed"
-		summary = "The apply failed."
-		if apply.ErrorMessage != "" {
-			summary = fmt.Sprintf("The apply failed: %s", apply.ErrorMessage)
-		}
 	default:
-		// stopped, reverted, or other terminal states
 		conclusion = checkConclusionFailure
-		title = fmt.Sprintf("Schema change %s", apply.State)
-		summary = fmt.Sprintf("The apply was %s.", apply.State)
 	}
 
-	opts := ghclient.CheckRunOptions{
-		Name:       checkRunName(check.Environment, check.DatabaseType, check.DatabaseName),
-		Status:     checkStatusCompleted,
-		Conclusion: conclusion,
-		Output: &ghclient.CheckRunOutput{
-			Title:   title,
-			Summary: summary,
-		},
-	}
-
-	if err := client.UpdateCheckRun(ctx, repo, check.CheckRunID, opts); err != nil {
-		h.logger.Error("failed to update check run after apply",
-			"checkRunID", check.CheckRunID, "conclusion", conclusion, "error", err)
-		return
-	}
-
-	// Update stored check record
 	check.Status = checkStatusCompleted
 	check.Conclusion = conclusion
 	check.HasChanges = conclusion != checkConclusionSuccess
@@ -244,12 +145,9 @@ func (h *Handler) updateCheckRunForApplyResult(ctx context.Context, repo string,
 		h.logger.Error("failed to update check record after apply", "error", err)
 	}
 
-	h.logger.Info("check run updated after apply",
+	h.logger.Info("check record updated after apply",
 		"repo", repo, "pr", pr, "database", apply.Database,
 		"environment", apply.Environment, "conclusion", conclusion)
-
-	// Update aggregate check to reflect the terminal state
-	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
 }
 
 // checkPriorEnvironments enforces environment ordering: all environments before
@@ -260,6 +158,11 @@ func (h *Handler) updateCheckRunForApplyResult(ctx context.Context, repo string,
 //   - applying to sandbox: no prior envs, always allowed
 //   - applying to staging: sandbox must be success
 //   - applying to production: both sandbox and staging must be success
+//
+// When allowed_environments is configured, this instance only owns a subset of
+// environments. For prior environments owned by this instance, the local database
+// is checked. For prior environments owned by another instance, the GitHub Checks
+// API is queried for the per-environment aggregate check run.
 func (h *Handler) checkPriorEnvironments(
 	ctx context.Context, repo string, pr int,
 	database, dbType, environment string,
@@ -280,50 +183,156 @@ func (h *Handler) checkPriorEnvironments(
 		return false
 	}
 
+	config := h.service.Config()
+
 	// Check all prior environments
 	for i := 0; i < currentIdx; i++ {
 		priorEnv := environments[i]
-		check, err := h.service.Storage().Checks().Get(ctx, repo, pr, priorEnv, dbType, database)
-		if err != nil {
-			h.logger.Error("failed to look up prior environment check",
-				"environment", priorEnv, "error", err)
-			// Graceful degradation: allow proceed if check lookup fails
-			continue
-		}
 
-		if check == nil {
-			// No check exists for this prior environment — it may not have changes.
-			// This is OK (e.g., staging has no changes but production does).
-			continue
-		}
-
-		switch {
-		case check.Conclusion == checkConclusionSuccess:
-			continue
-		case check.Status == checkStatusInProgress:
-			h.postComment(repo, pr, installationID,
-				templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
-			return true
-		default:
-			status := "has pending changes"
-			action := fmt.Sprintf("Apply %s first", priorEnv)
-			if check.Conclusion == checkConclusionFailure {
-				status = "failed"
-				action = fmt.Sprintf("Fix the issue and re-apply %s", priorEnv)
+		if config.IsEnvironmentAllowed(priorEnv) {
+			// This instance owns the prior environment — check local database
+			if blocked := h.checkPriorEnvViaLocal(ctx, repo, pr, database, dbType, environment, priorEnv, installationID); blocked {
+				return true
 			}
-			h.postComment(repo, pr, installationID,
-				templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
-			return true
+		} else {
+			// Another instance owns this environment — check GitHub Checks API
+			if blocked := h.checkPriorEnvViaGitHub(ctx, repo, pr, database, environment, priorEnv, installationID); blocked {
+				return true
+			}
 		}
 	}
 
 	return false
 }
 
-// updateAggregateCheck recomputes and creates/updates the single "SchemaBot" aggregate
-// check run that rolls up all per-database checks for a PR. This is the only check
-// that needs to be required in branch protection — it works regardless of how many
-// databases a PR touches.
+// checkPriorEnvViaLocal checks the prior environment status using the local database.
+func (h *Handler) checkPriorEnvViaLocal(
+	ctx context.Context, repo string, pr int,
+	database, dbType, environment, priorEnv string,
+	installationID int64,
+) bool {
+	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, priorEnv, dbType, database)
+	if err != nil {
+		h.logger.Error("failed to look up prior environment check",
+			"environment", priorEnv, "error", err)
+		// Graceful degradation: allow proceed if check lookup fails
+		return false
+	}
+
+	if check == nil {
+		// No check exists for this prior environment — it may not have changes.
+		// This is OK (e.g., staging has no changes but production does).
+		return false
+	}
+
+	switch {
+	case check.Conclusion == checkConclusionSuccess:
+		return false
+	case check.Status == checkStatusInProgress:
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
+		return true
+	default:
+		status := "has pending changes"
+		action := fmt.Sprintf("Apply %s first", priorEnv)
+		if check.Conclusion == checkConclusionFailure {
+			status = "failed"
+			action = fmt.Sprintf("Fix the issue and re-apply %s", priorEnv)
+		}
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
+		return true
+	}
+}
+
+// checkPriorEnvViaGitHub checks the prior environment status by querying the
+// GitHub Checks API for the per-environment aggregate check run created by the
+// other SchemaBot instance that owns that environment.
+//
+// The remote check uses the aggregate "SchemaBot (staging)" which rolls up ALL
+// databases in the prior environment. This is stricter than per-database checking:
+// production apply for any database is blocked until ALL databases in staging are
+// applied. This is the correct behavior for the remote case — we cannot query
+// per-database check state from another instance, and it is safer to require the
+// entire environment to be healthy before promoting.
+func (h *Handler) checkPriorEnvViaGitHub(
+	ctx context.Context, repo string, pr int,
+	database, environment, priorEnv string,
+	installationID int64,
+) bool {
+	client, err := h.ghClient.ForInstallation(installationID)
+	if err != nil {
+		h.logger.Error("failed to create GitHub client for prior env check, blocking apply",
+			"prior_env", priorEnv, "error", err)
+		h.postComment(repo, pr, installationID,
+			fmt.Sprintf("## ❌ Apply Blocked\n\nCould not verify %s status: failed to create GitHub client. Retry the apply command.\n\n_Error: %v_", priorEnv, err))
+		return true
+	}
+
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to fetch PR for prior env check, blocking apply",
+			"prior_env", priorEnv, "error", err)
+		h.postComment(repo, pr, installationID,
+			fmt.Sprintf("## ❌ Apply Blocked\n\nCould not verify %s status: failed to fetch PR details. Retry the apply command.\n\n_Error: %v_", priorEnv, err))
+		return true
+	}
+
+	checkName := aggregateCheckNameForEnv(priorEnv)
+	checkResult, err := client.FindCheckRunByName(ctx, repo, prInfo.HeadSHA, checkName)
+	if err != nil {
+		h.logger.Error("failed to query GitHub check for prior environment, blocking apply",
+			"prior_env", priorEnv, "check_name", checkName, "error", err)
+		h.postComment(repo, pr, installationID,
+			fmt.Sprintf("## ❌ Apply Blocked\n\nCould not verify %s status: failed to query check runs. Retry the apply command.\n\n_Error: %v_", priorEnv, err))
+		return true
+	}
+
+	if checkResult == nil {
+		// No check run from the other instance. This could mean:
+		// (a) The prior environment has no schema changes for this PR (legit — allow proceed)
+		// (b) The other instance hasn't processed the webhook yet (race — should block)
+		// We cannot distinguish these cases without additional coordination. For now,
+		// allow proceed since blocking on missing checks would break PRs that only
+		// touch a subset of environments. A future improvement could add a brief retry
+		// with backoff to handle case (b).
+		slog.Info("no GitHub check found for prior environment, allowing proceed",
+			"prior_env", priorEnv, "check_name", checkName, "repo", repo, "pr", pr)
+		return false
+	}
+
+	switch {
+	case checkResult.Status == checkStatusCompleted && checkResult.Conclusion == checkConclusionSuccess:
+		slog.Debug("prior environment verified via GitHub check",
+			"prior_env", priorEnv, "conclusion", checkResult.Conclusion)
+		return false
+	case checkResult.Status == checkStatusInProgress:
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
+		return true
+	default:
+		status := "has pending changes"
+		action := fmt.Sprintf("Apply %s first", priorEnv)
+		if checkResult.Conclusion == checkConclusionFailure {
+			status = "failed"
+			action = fmt.Sprintf("Fix the issue and re-apply %s", priorEnv)
+		}
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
+		return true
+	}
+}
+
+// updateAggregateCheck recomputes and creates/updates aggregate check runs that roll
+// up per-database checks for a PR.
+//
+// When allowed_environments is configured, per-environment aggregates are created
+// (e.g., "SchemaBot (staging)") that only roll up checks for that environment. This
+// allows separate SchemaBot instances to each publish their own aggregate without
+// conflicting with each other.
+//
+// When allowed_environments is NOT configured, a single "SchemaBot" aggregate is
+// created that rolls up all per-database checks (backwards compatible).
 //
 // Aggregate logic (first match wins):
 //   - ANY check "in_progress"     → aggregate status "in_progress"
@@ -338,7 +347,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		return
 	}
 
-	// Filter out the aggregate check itself — only per-database checks contribute
+	// Filter out aggregate checks — only per-database checks contribute
 	var dbChecks []*storage.Check
 	for _, c := range checks {
 		if !isAggregateCheck(c) {
@@ -353,11 +362,43 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		return
 	}
 
+	config := h.service.Config()
+
+	if len(config.AllowedEnvironments) > 0 {
+		// Per-environment aggregates: create one aggregate per allowed environment.
+		// Each uses the real environment name in the storage key to avoid collisions
+		// between environments (e.g., staging vs production aggregates).
+		for _, env := range config.AllowedEnvironments {
+			envChecks := filterChecksByEnvironment(dbChecks, env)
+			if len(envChecks) == 0 {
+				continue
+			}
+			checkName := aggregateCheckNameForEnv(env)
+			h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, envChecks, checkName, env)
+		}
+	} else {
+		// Single aggregate: backwards-compatible behavior. Uses aggregateSentinel
+		// for the environment field since there is no per-environment scoping.
+		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, aggregateCheckName, aggregateSentinel)
+	}
+}
+
+// upsertAggregateCheckRun computes the aggregate conclusion from the given checks
+// and creates or updates a GitHub check run with the specified name.
+//
+// The environment parameter controls the storage key: for per-environment aggregates
+// it is the real environment name (e.g., "staging"), for the global aggregate it is
+// aggregateSentinel. DatabaseType and DatabaseName always use aggregateSentinel.
+func (h *Handler) upsertAggregateCheckRun(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, headSHA string,
+	dbChecks []*storage.Check, checkName string, environment string,
+) {
 	conclusion, status := computeAggregate(dbChecks)
 	title, summary := aggregateSummary(dbChecks, conclusion)
 
 	opts := ghclient.CheckRunOptions{
-		Name:   aggregateCheckName,
+		Name:   checkName,
 		Status: status,
 		Output: &ghclient.CheckRunOutput{
 			Title:   title,
@@ -369,10 +410,10 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		opts.Conclusion = conclusion
 	}
 
-	// Look up existing aggregate check record
-	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	// Look up existing aggregate check record using the environment-specific key
+	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
 	if err != nil {
-		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "environment", environment, "error", err)
 		return
 	}
 
@@ -404,7 +445,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		Repository:   repo,
 		PullRequest:  pr,
 		HeadSHA:      headSHA,
-		Environment:  aggregateSentinel,
+		Environment:  environment,
 		DatabaseType: aggregateSentinel,
 		DatabaseName: aggregateSentinel,
 		CheckRunID:   checkRunID,
@@ -417,7 +458,8 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	}
 
 	h.logger.Info("aggregate check updated",
-		"repo", repo, "pr", pr, "status", status, "conclusion", conclusion,
+		"repo", repo, "pr", pr, "check_name", checkName,
+		"status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
 }
 
@@ -449,10 +491,10 @@ func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 func aggregateSummary(checks []*storage.Check, conclusion string) (title, summary string) {
 	switch conclusion {
 	case checkConclusionSuccess:
-		title = "All schema changes applied"
+		title = "All applies complete"
 		summary = buildAggregateTable(checks)
 	case checkConclusionFailure:
-		title = "Schema change failed"
+		title = "Apply failed"
 		summary = buildAggregateTable(checks)
 	case checkConclusionActionRequired:
 		pending := 0
@@ -461,11 +503,15 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 				pending++
 			}
 		}
-		title = fmt.Sprintf("%d schema change(s) pending", pending)
+		if pending == 1 {
+			title = "1 apply pending"
+		} else {
+			title = fmt.Sprintf("%d applies pending", pending)
+		}
 		summary = buildAggregateTable(checks)
 	default:
 		// in_progress — conclusion is empty
-		title = "Schema changes in progress"
+		title = "Apply in progress"
 		summary = buildAggregateTable(checks)
 	}
 	return title, summary

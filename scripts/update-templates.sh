@@ -117,6 +117,7 @@ render_cli_section() {
     local heading="$1"
     local preview_type="$2"
 
+    echo "" >> "$SNAPSHOT"
     echo "## ${heading}" >> "$SNAPSHOT"
     echo "" >> "$SNAPSHOT"
     "$BINARY" preview "$preview_type" 2>&1 | strip_ansi | wrap_sections 1 >> "$SNAPSHOT"
@@ -127,6 +128,16 @@ render_cli_section() {
 render_paired_section "Plan & Status"  "comment_plan_all"       "cli_plan_all"
 render_paired_section "Locking"        "comment_locking_all"    "cli_locking_all"
 render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
+
+# === PR-only sections ===
+{
+    echo ""
+    echo "## Apply Gates"
+    echo ""
+    echo "### PR Comments"
+    echo ""
+    "$BINARY" preview "comment_apply_all" 2>&1 | wrap_sections >> "$SNAPSHOT"
+}
 
 # === CLI-only sections ===
 render_cli_section "Sequential Mode (CLI)" "sequential_all"

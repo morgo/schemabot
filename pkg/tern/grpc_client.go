@@ -101,6 +101,7 @@ package tern
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"google.golang.org/grpc"
@@ -137,10 +138,21 @@ type Config struct {
 }
 
 // NewGRPCClient creates a new gRPC client connected to the given address.
+//
+// The address may include a port (e.g. "tern.example.com:80"). The full
+// address is used to dial, but the :authority pseudo-header is set to the
+// hostname only (without the port) so that intermediaries route based on
+// hostname rather than host:port.
 func NewGRPCClient(config Config) (*GRPCClient, error) {
+	host, _, err := net.SplitHostPort(config.Address)
+	if err != nil {
+		return nil, fmt.Errorf("split host:port from address %s: %w", config.Address, err)
+	}
+
 	conn, err := grpc.NewClient(
 		config.Address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithAuthority(host),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)

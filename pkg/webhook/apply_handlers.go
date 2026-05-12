@@ -533,8 +533,8 @@ func ddlMatchesStoredPlan(planResp *apitypes.PlanResponse, storedPlan *storage.P
 // SchemaBot's own checks and checks with conclusion "neutral", "skipped", or "success".
 // Only checks with completed status and conclusion "failure", "error", or "timed_out"
 // are considered failing.
-func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []templates.FailingCheck {
-	var failing []templates.FailingCheck
+func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []templates.BlockingCheck {
+	var failing []templates.BlockingCheck
 	for _, s := range statuses {
 		if s.IsSchemaBot {
 			continue
@@ -544,9 +544,9 @@ func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []templa
 		}
 		switch s.Conclusion {
 		case "failure", "error", "timed_out":
-			failing = append(failing, templates.FailingCheck{
-				Name:       s.Name,
-				Conclusion: s.Conclusion,
+			failing = append(failing, templates.BlockingCheck{
+				Name:  s.Name,
+				State: s.Conclusion,
 			})
 		}
 	}
@@ -603,17 +603,17 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 
 // filterInProgressNonSchemaBotChecks returns checks that are still running,
 // excluding SchemaBot's own checks.
-func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []templates.FailingCheck {
-	var inProgress []templates.FailingCheck
+func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []templates.BlockingCheck {
+	var inProgress []templates.BlockingCheck
 	for _, s := range statuses {
 		if s.IsSchemaBot {
 			continue
 		}
 		switch s.Status {
 		case "in_progress", "queued", "pending":
-			inProgress = append(inProgress, templates.FailingCheck{
-				Name:       s.Name,
-				Conclusion: s.Status,
+			inProgress = append(inProgress, templates.BlockingCheck{
+				Name:  s.Name,
+				State: s.Status,
 			})
 		}
 	}

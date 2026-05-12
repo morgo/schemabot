@@ -318,9 +318,9 @@ func TestPreviewCommentSummaryStopped(t *testing.T) {
 }
 
 func TestRenderApplyBlockedByFailingChecks(t *testing.T) {
-	failing := []FailingCheck{
-		{Name: "CI / unit-tests", Conclusion: "failure"},
-		{Name: "CI / lint", Conclusion: "timed_out"},
+	failing := []BlockingCheck{
+		{Name: "CI / unit-tests", State: "failure"},
+		{Name: "CI / lint", State: "timed_out"},
 	}
 
 	result := RenderApplyBlockedByFailingChecks("staging", failing)
@@ -335,8 +335,8 @@ func TestRenderApplyBlockedByFailingChecks(t *testing.T) {
 }
 
 func TestRenderApplyBlockedByFailingChecks_SingleCheck(t *testing.T) {
-	failing := []FailingCheck{
-		{Name: "security-scan", Conclusion: "error"},
+	failing := []BlockingCheck{
+		{Name: "security-scan", State: "error"},
 	}
 
 	result := RenderApplyBlockedByFailingChecks("production", failing)
@@ -347,9 +347,9 @@ func TestRenderApplyBlockedByFailingChecks_SingleCheck(t *testing.T) {
 }
 
 func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
-	inProgress := []FailingCheck{
-		{Name: "CI / unit-tests", Conclusion: "in_progress"},
-		{Name: "CI / integration", Conclusion: "queued"},
+	inProgress := []BlockingCheck{
+		{Name: "CI / unit-tests", State: "in_progress"},
+		{Name: "CI / integration", State: "queued"},
 	}
 
 	result := RenderApplyBlockedByInProgressChecks("staging", inProgress)

@@ -231,15 +231,18 @@ func RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, actio
 	return sb.String()
 }
 
-// FailingCheck represents a PR check that is blocking apply.
-type FailingCheck struct {
-	Name       string
-	Conclusion string // "failure", "error", "timed_out"
+// BlockingCheck represents a PR check that is blocking apply, either because
+// it failed or because it is still running. State holds the GitHub-reported
+// conclusion (e.g. "failure", "error", "timed_out") for failed checks, or the
+// status (e.g. "in_progress", "queued", "pending") for in-progress checks.
+type BlockingCheck struct {
+	Name  string
+	State string
 }
 
 // RenderApplyBlockedByFailingChecks renders a comment when apply is blocked
 // because non-SchemaBot PR checks are failing.
-func RenderApplyBlockedByFailingChecks(environment string, failing []FailingCheck) string {
+func RenderApplyBlockedByFailingChecks(environment string, failing []BlockingCheck) string {
 	var sb strings.Builder
 
 	sb.WriteString("## ❌ Apply Blocked\n\n")
@@ -248,7 +251,7 @@ func RenderApplyBlockedByFailingChecks(environment string, failing []FailingChec
 	sb.WriteString("| Check | Status |\n")
 	sb.WriteString("|-------|--------|\n")
 	for _, f := range failing {
-		fmt.Fprintf(&sb, "| `%s` | %s |\n", f.Name, f.Conclusion)
+		fmt.Fprintf(&sb, "| `%s` | %s |\n", f.Name, f.State)
 	}
 	sb.WriteString("\nFix the failing checks and retry:\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
@@ -258,7 +261,7 @@ func RenderApplyBlockedByFailingChecks(environment string, failing []FailingChec
 
 // RenderApplyBlockedByInProgressChecks renders a comment when apply is blocked
 // because non-SchemaBot PR checks are still running.
-func RenderApplyBlockedByInProgressChecks(environment string, inProgress []FailingCheck) string {
+func RenderApplyBlockedByInProgressChecks(environment string, inProgress []BlockingCheck) string {
 	var sb strings.Builder
 
 	sb.WriteString("## ⏳ Apply Blocked\n\n")
@@ -267,7 +270,7 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress []Faili
 	sb.WriteString("| Check | Status |\n")
 	sb.WriteString("|-------|--------|\n")
 	for _, c := range inProgress {
-		fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.Conclusion)
+		fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.State)
 	}
 	sb.WriteString("\nWait for checks to complete and retry:\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)

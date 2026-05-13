@@ -13,7 +13,9 @@ type CommandParser struct {
 	mentionRegex           *regexp.Regexp
 	helpRegex              *regexp.Regexp
 	commandWithoutEnvRegex *regexp.Regexp
+	rollbackCommandRegex   *regexp.Regexp
 	rollbackRegex          *regexp.Regexp // rollback <apply-id>
+	environmentRegex       *regexp.Regexp // -e <env>
 	databaseRegex          *regexp.Regexp
 	skipRevertRegex        *regexp.Regexp
 	deferCutoverRegex      *regexp.Regexp
@@ -28,7 +30,9 @@ func NewCommandParser() *CommandParser {
 		mentionRegex:           regexp.MustCompile(`(?i)\bschemabot\b`),
 		helpRegex:              regexp.MustCompile(`(?i)schemabot\s+help\b`),
 		commandWithoutEnvRegex: regexp.MustCompile(`(?i)schemabot\s+(plan|apply|apply-confirm|unlock|stop|revert|skip-revert|cutover|rollback|rollback-confirm|fix-lint)\b`),
+		rollbackCommandRegex:   regexp.MustCompile(`(?i)schemabot\s+rollback(?:\s|$)`),
 		rollbackRegex:          regexp.MustCompile(`(?i)schemabot\s+rollback\s+(apply[_-][a-f0-9]+)`),
+		environmentRegex:       regexp.MustCompile(`(?i)-e\s+(staging|production)`),
 		databaseRegex:          regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
 		skipRevertRegex:        regexp.MustCompile(`(?i)--skip-revert\b`),
 		deferCutoverRegex:      regexp.MustCompile(`(?i)--defer-cutover\b`),
@@ -60,19 +64,29 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 		return CommandResult{Action: action.Help, IsHelp: true, IsMention: true}
 	}
 
-	// Check rollback <apply-id> (positional arg, no -e flag)
-	rollbackMatches := p.rollbackRegex.FindStringSubmatch(body)
-	if len(rollbackMatches) >= 2 {
+	// Check rollback <apply-id> -e <env>
+	if p.rollbackCommandRegex.MatchString(body) {
 		result := CommandResult{
 			Action:       action.Rollback,
-			ApplyID:      rollbackMatches[1],
-			Found:        true,
 			IsMention:    true,
 			DeferCutover: p.deferCutoverRegex.MatchString(body),
+		}
+		rollbackMatches := p.rollbackRegex.FindStringSubmatch(body)
+		if len(rollbackMatches) >= 2 {
+			result.ApplyID = rollbackMatches[1]
 		}
 		dbMatches := p.databaseRegex.FindStringSubmatch(body)
 		if len(dbMatches) >= 2 {
 			result.Database = dbMatches[1]
+		}
+		envMatches := p.environmentRegex.FindStringSubmatch(body)
+		if len(envMatches) >= 2 {
+			result.Environment = strings.ToLower(envMatches[1])
+		}
+		if result.Environment != "" {
+			result.Found = true
+		} else {
+			result.MissingEnv = true
 		}
 		return result
 	}

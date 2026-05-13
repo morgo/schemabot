@@ -351,14 +351,14 @@ func PreviewCLIOutput(previewType PreviewType) {
 	case PreviewCommentReviewGateError:
 		fmt.Print(webhooktemplates.PreviewCommentReviewGateError())
 	case PreviewCommentChecksGateFailing:
-		fmt.Print(webhooktemplates.RenderApplyBlockedByFailingChecks("staging", []webhooktemplates.FailingCheck{
-			{Name: "CI / unit-tests", Conclusion: "failure"},
-			{Name: "CI / lint", Conclusion: "timed_out"},
+		fmt.Print(webhooktemplates.RenderApplyBlockedByFailingChecks("staging", []webhooktemplates.BlockingCheck{
+			{Name: "CI / unit-tests", State: "failure"},
+			{Name: "CI / lint", State: "timed_out"},
 		}))
 	case PreviewCommentChecksGateInProgress:
-		fmt.Print(webhooktemplates.RenderApplyBlockedByInProgressChecks("staging", []webhooktemplates.FailingCheck{
-			{Name: "CI / unit-tests", Conclusion: "in_progress"},
-			{Name: "CI / integration-tests", Conclusion: "queued"},
+		fmt.Print(webhooktemplates.RenderApplyBlockedByInProgressChecks("staging", []webhooktemplates.BlockingCheck{
+			{Name: "CI / unit-tests", State: "in_progress"},
+			{Name: "CI / integration-tests", State: "queued"},
 		}))
 	case PreviewCommentApplyAllType:
 		previewApplyCommandAllOutput()
@@ -957,15 +957,15 @@ func previewApplyCommandAllOutput() {
 		{"REVIEW REQUIRED (CODEOWNERS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
 		{"REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
 		{"CHECKS GATE: FAILING", func() {
-			fmt.Print(webhooktemplates.RenderApplyBlockedByFailingChecks("staging", []webhooktemplates.FailingCheck{
-				{Name: "CI / unit-tests", Conclusion: "failure"},
-				{Name: "CI / lint", Conclusion: "timed_out"},
+			fmt.Print(webhooktemplates.RenderApplyBlockedByFailingChecks("staging", []webhooktemplates.BlockingCheck{
+				{Name: "CI / unit-tests", State: "failure"},
+				{Name: "CI / lint", State: "timed_out"},
 			}))
 		}},
 		{"CHECKS GATE: IN PROGRESS", func() {
-			fmt.Print(webhooktemplates.RenderApplyBlockedByInProgressChecks("staging", []webhooktemplates.FailingCheck{
-				{Name: "CI / unit-tests", Conclusion: "in_progress"},
-				{Name: "CI / integration-tests", Conclusion: "queued"},
+			fmt.Print(webhooktemplates.RenderApplyBlockedByInProgressChecks("staging", []webhooktemplates.BlockingCheck{
+				{Name: "CI / unit-tests", State: "in_progress"},
+				{Name: "CI / integration-tests", State: "queued"},
 			}))
 		}},
 	}

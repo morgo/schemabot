@@ -119,11 +119,11 @@ func TestFilterInProgressNonSchemaBotChecks(t *testing.T) {
 	inProgress := filterInProgressNonSchemaBotChecks(statuses)
 	require.Len(t, inProgress, 3)
 	assert.Equal(t, "CI / tests", inProgress[0].Name)
-	assert.Equal(t, "in_progress", inProgress[0].Conclusion)
+	assert.Equal(t, "in_progress", inProgress[0].State)
 	assert.Equal(t, "Security scan", inProgress[1].Name)
-	assert.Equal(t, "queued", inProgress[1].Conclusion)
+	assert.Equal(t, "queued", inProgress[1].State)
 	assert.Equal(t, "Deploy preview", inProgress[2].Name)
-	assert.Equal(t, "pending", inProgress[2].Conclusion)
+	assert.Equal(t, "pending", inProgress[2].State)
 }
 
 // rollupNode is a single GraphQL statusCheckRollup contexts node, used by tests

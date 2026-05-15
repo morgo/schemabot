@@ -142,4 +142,27 @@ fi
 # e2e packages are test-only (_test.go) so singlechecker can't analyze them.
 # The e2e tests reuse the same patterns caught by the default + integration runs.
 
+# Run webhookheaders analyzer when any pkg/webhook/ source (excluding templates)
+# is staged. Flags inline `## ...` markdown headers that should live in
+# pkg/webhook/templates/ and render via templates.Render…
+if [ -n "$PKG_FILES" ]; then
+    WEBHOOK_FILES=$(echo "$PKG_FILES" | grep '^pkg/webhook/' | grep -v '^pkg/webhook/templates/' || true)
+    if [ -n "$WEBHOOK_FILES" ]; then
+        # `grep -v` exits non-zero (and would trip `set -e`) when every package
+        # is filtered out, so suppress that exit and fall through to a clear
+        # message instead of dying silently.
+        WEBHOOK_PKGS=$(go list ./pkg/webhook/... | grep -v '/templates$' || true)
+        if [ -z "$WEBHOOK_PKGS" ]; then
+            echo "webhookheaders: no packages to check (only pkg/webhook/templates exists), skipping."
+        else
+            echo "Running webhookheaders analyzer..."
+            if ! go run ./cmd/webhookheaders-check $WEBHOOK_PKGS 2>&1; then
+                echo ""
+                echo 'webhookheaders: move the `## ...` body into pkg/webhook/templates/ and render it via a templates.Render… helper.'
+                exit 1
+            fi
+        fi
+    fi
+fi
+
 echo "All lint checks passed!"

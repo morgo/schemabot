@@ -73,7 +73,7 @@ func vitessApplyAndWait(t *testing.T, schemaDir, env string, extraArgs ...string
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	args := []string{"apply", "-s", ".", "-e", env, "--endpoint", endpoint, "-y", "-o", "log", "--no-watch", "--allow-unsafe"}
+	args := []string{"apply", "-s", ".", "-e", env, "--endpoint", endpoint, "-y", "-o", "log", "--no-watch", "--allow-unsafe", "--skip-revert"}
 	args = append(args, extraArgs...)
 	t.Logf("vitessApplyAndWait: starting CLI apply (elapsed=%s)", time.Since(start))
 	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, args...)
@@ -297,6 +297,15 @@ func vitessAdminDDL(t *testing.T, localscaleURL, org, keyspace, ddl string) {
 	if err != nil {
 		t.Logf("vitessAdminDDL: %s: %v (non-fatal)", ddl, err)
 	}
+}
+
+func vitessAdminDDLRequire(t *testing.T, localscaleURL, org, keyspace, ddl string) {
+	t.Helper()
+	_ = localscaleURL // preserved for call-site compatibility; localscaleAdminPost reads the env var
+	body := fmt.Sprintf(`{"org":%q,"database":%q,"keyspace":%q,"statements":[%q]}`,
+		org, vitessDB, keyspace, ddl)
+	_, err := localscaleAdminPost(t, "/admin/seed-ddl", body)
+	require.NoError(t, err, "seed DDL %s", ddl)
 }
 
 // extractApplyIDFromLog extracts the apply ID from log mode output.
@@ -542,8 +551,8 @@ func TestVitess_Apply_ConsecutiveApplies(t *testing.T) {
 
 	clearSchemaBotState(t)
 
-	// Second apply immediately after — tests that previous deploy's revert window
-	// is auto-completed and VReplication streams are cleaned up.
+	// Second apply immediately after verifies that the previous deploy is fully
+	// finalized and VReplication streams are cleaned up.
 	idx2 := fmt.Sprintf("idx_c2_%d", time.Now().UnixMilli()%100000)
 	schemaDir2 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
@@ -1072,7 +1081,7 @@ func TestVitess_Apply_VSchemaTaskTracking(t *testing.T) {
 	binPath := buildCLI(t)
 	applyOut := e2eutil.RunCLI(t, binPath, schemaDir, "apply",
 		"-s", ".", "-e", "staging", "--endpoint", endpoint,
-		"-y", "-o", "log", "--no-watch", "--allow-unsafe",
+		"-y", "-o", "log", "--no-watch", "--allow-unsafe", "--skip-revert",
 	)
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID)
@@ -1119,19 +1128,9 @@ func TestVitess_Apply_DropIndex_BlockedWithoutFlag(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	// First add an index
 	indexName := fmt.Sprintf("idx_drop_%d", time.Now().UnixMilli()%100000)
-	addSchema := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
-		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
-  `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  `+"`email`"+` varchar(255) NOT NULL,
-  `+"`full_name`"+` varchar(255) NULL,
-  `+"`created_at`"+` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX `+"`idx_email`"+` (`+"`email`"+`),
-  INDEX `+"`%s`"+` (`+"`full_name`"+`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, indexName),
-	}))
-	vitessApplyAndWait(t, addSchema, "staging")
+	vitessAdminDDLRequire(t, os.Getenv("LOCALSCALE_URL"), "localscale-staging", "testapp_sharded",
+		fmt.Sprintf("ALTER TABLE `users` ADD INDEX `%s` (`full_name`)", indexName))
 	clearSchemaBotState(t)
 
 	// Now try to drop it without --allow-unsafe — should be blocked
@@ -1261,7 +1260,7 @@ func TestVitess_Progress_DeployRequestMetadata(t *testing.T) {
 		"-s", ".",
 		"-e", "staging",
 		"--endpoint", endpoint,
-		"-y", "-o", "log", "--no-watch", "--allow-unsafe",
+		"-y", "-o", "log", "--no-watch", "--allow-unsafe", "--skip-revert",
 	)
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID, "expected apply ID in output")

@@ -1225,26 +1225,14 @@ func TestE2EApplyAutoConfirmExecutes(t *testing.T) {
 		"expected apply summary comment")
 }
 
-// TestE2EApplyAutoConfirmDowngradesOnSHAMismatch verifies that -y downgrades to
-// manual confirmation when the HEAD SHA doesn't match the stored check record.
-func TestE2EApplyAutoConfirmDowngradesOnSHAMismatch(t *testing.T) {
-	dbName := "webhook_auto_confirm_sha"
+// TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced verifies that `apply -y`
+// rejects (does NOT apply, releases the lock) when the PR HEAD advances
+// between discovery (cached FetchPullRequest) and the fresh
+// FetchPullRequestNoCache fetch inside the auto-confirm branch. The user
+// must re-run the command so discovery picks up the new HEAD.
+func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
+	dbName := "webhook_auto_confirm_stale"
 	svc := setupE2EService(t, dbName)
-
-	// Seed a check record with a DIFFERENT SHA than what FetchPullRequest returns ("abc123")
-	check := &storage.Check{
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
-		HeadSHA:      "oldsha999",
-		Environment:  "staging",
-		DatabaseType: "mysql",
-		DatabaseName: dbName,
-		CheckRunID:   1,
-		HasChanges:   true,
-		Status:       checkStatusCompleted,
-		Conclusion:   checkConclusionActionRequired,
-	}
-	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), check))
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -1259,6 +1247,9 @@ func TestE2EApplyAutoConfirmDowngradesOnSHAMismatch(t *testing.T) {
 	}
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	// Discovery (cached FetchPullRequest) sees abc123; the NoCache fetch
+	// inside the auto-confirm branch sees a new commit at newsha456.
+	result.HeadSHAs = []string{"abc123", "newsha456"}
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1270,15 +1261,299 @@ func TestE2EApplyAutoConfirmDowngradesOnSHAMismatch(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// Should get a plan comment with the downgrade warning, NOT "Applying automatically"
+	// Drain all comments posted during the delivery: we expect at least one
+	// rejection comment and zero "Applying automatically" comments.
+	deadline := time.After(30 * time.Second)
+	var rejection string
+	for {
+		select {
+		case body := <-result.comments:
+			assert.NotContains(t, body, "Applying automatically", "apply must not auto-confirm on stale schema")
+			if strings.Contains(body, "Rejected") && strings.Contains(body, "new commits since discovery") {
+				rejection = body
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for rejection comment")
+		}
+		if rejection != "" {
+			break
+		}
+	}
+
+	assert.Contains(t, rejection, "abc123", "rejection must show discovery SHA")
+	assert.Contains(t, rejection, "newsha456", "rejection must show current SHA")
+	assert.Contains(t, rejection, "schemabot apply -e staging", "retry hint must reference the env")
+
+	// Lock acquired earlier in handleApplyCommand must be released so the user
+	// can re-run `schemabot apply` cleanly. The release runs in the handler
+	// goroutine after postComment returns, so poll briefly.
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "lock must be released after stale-schema rejection")
+
+	// No apply record should exist — executeApply must not have been reached.
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, a := range applies {
+		assert.NotEqual(t, dbName, a.Database, "no apply for %s should have been started", dbName)
+	}
+}
+
+// TestE2EApplyConfirmRejectsWhenHEADAdvanced verifies that `apply-confirm`
+// rejects (does NOT apply, releases the lock) when the PR HEAD advances
+// between discovery (cached FetchPullRequest) and the fresh
+// FetchPullRequestNoCache fetch used by the checks gate.
+func TestE2EApplyConfirmRejectsWhenHEADAdvanced(t *testing.T) {
+	dbName := "webhook_confirm_stale"
+	svc := setupE2EService(t, dbName)
+
+	// apply-confirm requires a pre-existing lock from a prior `apply`.
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName: dbName,
+		DatabaseType: "mysql",
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		Owner:        "octocat/hello-world#1",
+	}))
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.HeadSHAs = []string{"abc123", "newsha456"}
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Auto-confirm skipped")
-		assert.Contains(t, body, "New commits pushed since auto-plan")
-		assert.NotContains(t, body, "Applying automatically")
-		assert.Contains(t, body, "apply-confirm", "should show manual confirm instructions")
+		assert.Contains(t, body, "Rejected")
+		assert.Contains(t, body, "new commits since discovery")
+		assert.Contains(t, body, "abc123", "must show discovery SHA")
+		assert.Contains(t, body, "newsha456", "must show current SHA")
+		assert.Contains(t, body, "schemabot apply-confirm -e staging", "retry hint must show full retry command")
+		assert.NotContains(t, body, "Schema Change In Progress", "apply must not have started")
+		assert.NotContains(t, body, "Schema Change Applied", "apply must not have completed")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for downgraded plan comment")
+		t.Fatal("timed out waiting for rejection comment")
+	}
+
+	// Lock must be released after rejection so the user can re-run `apply`.
+	// The release runs in the handler goroutine after postComment returns,
+	// so poll briefly.
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "lock must be released after stale-schema rejection")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, a := range applies {
+		assert.NotEqual(t, dbName, a.Database, "no apply for %s should have been started", dbName)
+	}
+}
+
+// TestE2EApplyManualRejectsWhenHEADAdvanced verifies that `schemabot apply`
+// (without -y) rejects and releases the lock when the PR HEAD advances
+// between discovery and the freshness check, instead of posting a stale
+// confirmation plan that the user might `apply-confirm` against. Symmetric
+// to TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced but covers the manual
+// (non-auto-confirm) path that aparajon flagged in PR #134 review.
+//
+// Without this guard, a fresh discovery at apply-confirm time would see the
+// new HEAD and the confirm-time freshness check would pass — but the plan
+// the user reviewed was rendered for the old commit.
+func TestE2EApplyManualRejectsWhenHEADAdvanced(t *testing.T) {
+	dbName := "webhook_manual_apply_stale"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	// Discovery (cached FetchPullRequest) sees abc123; the NoCache fetch
+	// just before posting the manual plan sees a new commit at newsha456.
+	result.HeadSHAs = []string{"abc123", "newsha456"}
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// Drain comments looking for the rejection. The handler must not post a
+	// plan comment (with or without the confirmation footer).
+	deadline := time.After(30 * time.Second)
+	var rejection string
+	for rejection == "" {
+		select {
+		case body := <-result.comments:
+			assert.NotContains(t, body, "Schema Change Plan", "manual apply must not post a stale plan comment")
+			assert.NotContains(t, body, "Applying automatically", "manual apply must never auto-confirm")
+			if strings.Contains(body, "Rejected") && strings.Contains(body, "new commits since discovery") {
+				rejection = body
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for rejection comment")
+		}
+	}
+
+	assert.Contains(t, rejection, "abc123", "rejection must show discovery SHA")
+	assert.Contains(t, rejection, "newsha456", "rejection must show current SHA")
+	assert.Contains(t, rejection, "schemabot apply -e staging", "retry hint must reference the env")
+
+	// Lock acquired earlier in handleApplyCommand must be released so the
+	// user can re-run cleanly. Release runs after postComment; poll briefly.
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "lock must be released after stale-schema rejection")
+}
+
+// TestE2EApplyConfirmStaleSchemaPreservesOtherPRLock verifies that when
+// `apply-confirm` runs on PR #1 and the schema-freshness check rejects, the
+// per-target lock held by a different PR (#999) is NOT released. Using
+// owner-scoped Release rather than ForceRelease ensures stale-schema
+// rejections cannot inadvertently clear an unrelated PR's lock.
+func TestE2EApplyConfirmStaleSchemaPreservesOtherPRLock(t *testing.T) {
+	dbName := "webhook_confirm_stale_otherlock"
+	svc := setupE2EService(t, dbName)
+
+	// Pre-seed a lock owned by a different PR (#999).
+	otherOwner := "octocat/hello-world#999"
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName: dbName,
+		DatabaseType: "mysql",
+		Repository:   "octocat/hello-world",
+		PullRequest:  999,
+		Owner:        otherOwner,
+	}))
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	// HEAD advances between cached discovery and NoCache fetch, triggering
+	// the stale-schema rejection on PR #1.
+	result.HeadSHAs = []string{"abc123", "newsha456"}
+	h := newE2EHandler(t, svc, client)
+
+	// Webhook delivery for PR #1 — but the lock is held by PR #999.
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Rejected", "stale-schema rejection must still post the rejection comment")
+		assert.Contains(t, body, "new commits since discovery")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for rejection comment")
+	}
+
+	// The other PR's lock must remain intact for the full polling window —
+	// long enough for the handler's owner-scoped Release attempt to land
+	// (and silently no-op as ErrLockNotOwned) before t.Cleanup tears down
+	// the containers. require.Never both asserts the lock is preserved and
+	// synchronises with the async handler so we don't race shutdown.
+	require.Never(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err != nil || lock == nil || lock.Owner != otherOwner
+	}, 1*time.Second, 50*time.Millisecond, "other PR's lock must remain intact after stale-schema rejection on PR #1")
+}
+
+// TestE2EPlanRejectsWhenHEADAdvanced verifies that `schemabot plan` rejects
+// (does NOT post a plan comment rendered against stale schema files) when
+// the PR HEAD advances between discovery and the freshness check.
+func TestE2EPlanRejectsWhenHEADAdvanced(t *testing.T) {
+	dbName := "webhook_plan_stale"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.HeadSHAs = []string{"abc123", "newsha456"}
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Rejected")
+		assert.Contains(t, body, "new commits since discovery")
+		assert.Contains(t, body, "abc123")
+		assert.Contains(t, body, "newsha456")
+		assert.Contains(t, body, "schemabot plan -e staging")
+		assert.NotContains(t, body, "Schema Change Plan", "stale plan comment must not be posted")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for rejection comment")
 	}
 }
 

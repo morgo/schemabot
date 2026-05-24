@@ -82,6 +82,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		SchemaFiles:   schemaResult.SchemaFiles,
 		Repository:    repo,
 		PullRequest:   &prNumber,
+		HeadSHA:       &schemaResult.HeadSHA,
 		SchemaPath:    schemaResult.SchemaPath,
 		SourceTrusted: true,
 	}
@@ -274,6 +275,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 			SchemaFiles:   schemaResult.SchemaFiles,
 			Repository:    repo,
 			PullRequest:   &prNumber,
+			HeadSHA:       &schemaResult.HeadSHA,
 			SchemaPath:    schemaResult.SchemaPath,
 			SourceTrusted: true,
 		}

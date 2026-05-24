@@ -34,6 +34,17 @@ type Lock struct {
 	// For CLI: "cli:user@hostname" or similar
 	Owner string
 
+	// PendingPlanID is the plan_identifier of the apply-confirmation plan that
+	// posted this lock. apply-confirm loads this exact plan to evaluate the
+	// cross-delivery freshness invariant, instead of guessing from "newest plan
+	// for repo+pr+env+database" (which can pick up plain `schemabot plan`
+	// results posted after the confirmation plan).
+	//
+	// Empty when the lock was acquired outside the apply path (rollback, CLI
+	// unlock/lock, or a row written before this column existed). The confirm
+	// path treats empty as "skip the freshness check" rather than fail closed.
+	PendingPlanID string
+
 	// CreatedAt is when the lock was acquired.
 	CreatedAt time.Time
 
@@ -226,6 +237,17 @@ type Plan struct {
 	// Namespaces contains per-namespace plan data (DDL changes, original schema, VSchema).
 	// The key is the database/schema name for MySQL, or keyspace name for Vitess.
 	Namespaces map[string]*NamespacePlanData
+
+	// HeadSHA is the PR HEAD SHA at the time the plan was rendered. It is the
+	// durable record of "which commit did the user actually review". apply-confirm
+	// compares this against the current PR HEAD (via FetchPullRequestNoCache) to
+	// catch the cross-delivery race where HEAD advances between the plan being
+	// posted and the user clicking apply-confirm.
+	//
+	// Empty for plans created before this column existed. Callers that enforce the
+	// cross-delivery freshness invariant must treat an empty value as "skip" (the
+	// invariant cannot be evaluated) rather than fail closed.
+	HeadSHA string
 
 	// CreatedAt is when the plan was generated.
 	CreatedAt time.Time

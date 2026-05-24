@@ -15,7 +15,7 @@ import (
 
 // planColumns lists all columns for SELECT queries.
 const planColumns = `id, plan_identifier, database_name, database_type,
-	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, created_at`
+	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, created_at`
 
 // planStore implements storage.PlanStore using MySQL.
 type planStore struct {
@@ -35,9 +35,9 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 	}
 
 	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.CreatedAt)
+		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.CreatedAt)
 	if err != nil {
 		if isDuplicateKeyError(err) {
 			return 0, storage.ErrPlanIDExists
@@ -82,13 +82,19 @@ func (s *planStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Pla
 	return nil, nil
 }
 
-// GetByPR returns all plans for a PR.
+// GetByPR returns all plans for a PR, newest first.
+//
+// Ordering is (created_at DESC, id DESC). The id tiebreaker matters: plans.created_at
+// is datetime (second precision), so two plans inserted in the same second would
+// otherwise tie and MySQL could return them in either order. Callers like
+// latestPlanForTarget take the first matching row as "the newest plan" and rely
+// on this deterministic order to avoid picking an older SHA on ties.
 func (s *planStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Plan, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+planColumns+`
 		FROM plans
 		WHERE repository = ? AND pull_request = ?
-		ORDER BY created_at DESC
+		ORDER BY created_at DESC, id DESC
 	`, repo, pr)
 	if err != nil {
 		return nil, fmt.Errorf("query plans for %s#%d: %w", repo, pr, err)
@@ -154,6 +160,7 @@ func scanPlanInto(s scanner) (*storage.Plan, error) {
 		&plan.Environment,
 		&schemaFilesJSON,
 		&planDataJSON,
+		&plan.HeadSHA,
 		&plan.CreatedAt,
 	)
 	if err != nil {

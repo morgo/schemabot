@@ -8,13 +8,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.7
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.7
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.1
-	github.com/block/spirit v0.13.1-0.20260520142740-426498a87b3f
+	github.com/block/spirit v0.14.1-0.20260527185805-39749a6c5924
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/docker/go-connections v0.6.0
-	github.com/go-mysql-org/go-mysql v1.13.0
+	github.com/go-mysql-org/go-mysql v1.15.1-0.20260526024741-088eb1fbf0ea
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/google/go-github/v86 v86.0.0
 	github.com/google/uuid v1.6.0

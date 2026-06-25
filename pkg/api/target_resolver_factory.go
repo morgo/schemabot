@@ -134,16 +134,19 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 
 // etreAssembler selects the engine-specific connection assembler for the
 // configured database type, plus the secret decoder that backend needs. MySQL
-// builds a namespace-free DSN from the host; Vitess assembles PlanetScale API
-// metadata and decodes a token secret rather than a username/password. A new
-// engine (postgres, strata) is a new case here; an unsupported type fails closed.
+// builds a namespace-free DSN from the host; Strata is backed by an Aurora
+// cluster reached over the MySQL protocol, so it assembles its connection the
+// same way (host + port + credentials → DSN) and reads the same MySQL block;
+// Vitess assembles PlanetScale API metadata and decodes a token secret rather
+// than a username/password. A new engine (postgres) is a new case here; an
+// unsupported type fails closed.
 func etreAssembler(cfg EtreConfig) (inventory.ConnectionAssembler, inventory.SecretDecoder, error) {
 	switch cfg.DatabaseType {
 	case "":
-		return nil, nil, fmt.Errorf("target_resolver.etre.database_type is required (%q or %q)", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)
-	case storage.DatabaseTypeMySQL:
+		return nil, nil, fmt.Errorf("target_resolver.etre.database_type is required (%q, %q, or %q)", storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata, storage.DatabaseTypeVitess)
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata:
 		if cfg.MySQL.HostField == "" {
-			return nil, nil, fmt.Errorf("target_resolver.etre.mysql.host_field is required for the %q engine", storage.DatabaseTypeMySQL)
+			return nil, nil, fmt.Errorf("target_resolver.etre.mysql.host_field is required for the %q engine", cfg.DatabaseType)
 		}
 		return inventory.MySQLConnectionAssembler{DefaultPort: cfg.MySQL.DefaultPort}, nil, nil
 	case storage.DatabaseTypeVitess:

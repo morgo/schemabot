@@ -70,6 +70,18 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue
 		}
 
+		// A task left non-terminal after its apply reached a terminal state is an
+		// orphan: the apply finished without transitioning the task, so there is no
+		// in-flight work it represents. It must not block new applies — and the
+		// engine stale check below cannot clear it for a sharded engine (Strata),
+		// whose Progress is per-operation and instance-local, so without this skip
+		// an orphaned shard task wedges the database's apply slot permanently.
+		if c.taskApplyIsTerminal(ctx, t) {
+			c.logger.Info("conflict check: ignoring task orphaned under a terminal apply",
+				"task_id", t.TaskIdentifier, "apply_id", t.ApplyID, "task_state", t.State)
+			continue
+		}
+
 		// Storage says non-terminal — verify with engine before blocking.
 		if c.tryResolveStaleTask(ctx, t, plan.Database) {
 			continue // Task was stale; engine confirmed it's done.
@@ -79,6 +91,25 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		return t.TaskIdentifier
 	}
 	return ""
+}
+
+// taskApplyIsTerminal reports whether the task's parent apply is in a terminal
+// state. A non-terminal task under a terminal apply is an orphan — the apply
+// finished without transitioning the task — so it represents no in-flight work
+// and must not block new applies. A missing apply id or a lookup failure fails
+// safe (false), so a genuinely in-flight task is never wrongly admitted past the
+// conflict check on a transient storage error.
+func (c *LocalClient) taskApplyIsTerminal(ctx context.Context, t *storage.Task) bool {
+	if t.ApplyID == 0 {
+		return false
+	}
+	apply, err := c.storage.Applies().Get(ctx, t.ApplyID)
+	if err != nil || apply == nil {
+		c.logger.Warn("conflict check: could not load task's apply; treating the task as active",
+			"task_id", t.TaskIdentifier, "apply_id", t.ApplyID, "error", err)
+		return false
+	}
+	return state.IsTerminalApplyState(apply.State)
 }
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.

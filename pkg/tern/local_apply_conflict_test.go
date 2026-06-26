@@ -208,6 +208,41 @@ func TestConflictCheckIsPerShard(t *testing.T) {
 		"an active task on shard -40 must block another apply on shard -40")
 }
 
+// A task left non-terminal after its apply reached a terminal state is an orphan
+// (the apply finished without transitioning the task — e.g. a sharded apply whose
+// completion poll could not mark its task done). It must not block a new apply: a
+// sharded engine's stale-task check cannot clear it, so without the terminal-apply
+// skip such an orphan wedges the database's apply slot permanently.
+func TestConflictCheckIgnoresTaskOrphanedUnderTerminalApply(t *testing.T) {
+	orphan := &storage.Task{
+		ID: 1, ApplyID: 42, TaskIdentifier: "task-orphan",
+		Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeStrata,
+		Namespace: "cdb_resolute_sharded", TableName: "mutes", Shard: "-40",
+		State: state.Task.Running, // stuck running…
+	}
+	plan := &storage.Plan{Database: "cdb_resolute", DatabaseType: storage.DatabaseTypeStrata}
+	newClient := func(applyState string) *LocalClient {
+		return &LocalClient{
+			config: LocalConfig{Database: "cdb_resolute", Type: storage.DatabaseTypeStrata},
+			storage: &exactProgressStorage{
+				tasks:   &exactProgressTaskStore{tasks: []*storage.Task{orphan}},
+				applies: &exactProgressApplyStore{apply: &storage.Apply{ID: 42, State: applyState}},
+				logs:    &mockApplyLogStore{},
+			},
+			logger: slog.Default(),
+		}
+	}
+
+	// …but its apply is terminal, so the task is an orphan and must not block.
+	assert.Empty(t, newClient(state.Apply.Completed).findBlockingTask(t.Context(), []*storage.Task{orphan}, plan, "-40"),
+		"a task orphaned under a terminal apply must not block a new apply")
+
+	// Sanity: under a still-active apply the task is not treated as an orphan — it
+	// falls through to the engine stale check (no engine here, so it stays blocking).
+	assert.Equal(t, "task-orphan", newClient(state.Apply.Running).findBlockingTask(t.Context(), []*storage.Task{orphan}, plan, "-40"),
+		"a task under a non-terminal apply still blocks")
+}
+
 // Once an abandoned in-flight task has been failed, it no longer blocks the
 // database, so a new apply is admitted.
 func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
